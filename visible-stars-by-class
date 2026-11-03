@@ -1,0 +1,718 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import csv
+import math
+import os
+import queue
+import re
+import tempfile
+import threading
+import urllib.request
+import warnings
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+import numpy as np
+
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.figure import Figure
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+warnings.filterwarnings("ignore", category=UserWarning)
+
+CLASSES = "OBAFGKM"
+HYG_URL = "https://raw.githubusercontent.com/astronexus/HYG-Database/main/hyg/CURRENT/hygdata_v41.csv"
+CACHE_DIR = Path.home() / ".cache" / "visible_stars"
+CACHE_FILE = CACHE_DIR / "hyg_v41_mag7.csv"
+CACHE_MAG = 7.0
+
+GREEK = {"Alp": "α", "Bet": "β", "Gam": "γ", "Del": "δ", "Eps": "ε", "Zet": "ζ", "Eta": "η",
+         "The": "θ", "Iot": "ι", "Kap": "κ", "Lam": "λ", "Mu": "μ", "Nu": "ν", "Xi": "ξ",
+         "Omi": "ο", "Pi": "π", "Rho": "ρ", "Sig": "σ", "Tau": "τ", "Ups": "υ", "Phi": "φ",
+         "Chi": "χ", "Psi": "ψ", "Ome": "ω"}
+SPECT_RE = re.compile(r"^\s*(?:sd|d|g|c)?([OBAFGKM])(\d+(?:\.\d+)?)?")
+COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+
+
+# ----------------------------------------------------------------------------------------------
+# Star catalogue
+# ----------------------------------------------------------------------------------------------
+def spectral_class(spect):
+    m = SPECT_RE.match(spect or "")
+    return m.group(1) if m else None
+
+
+def star_name(r):
+    proper = (r.get("proper") or "").strip()
+    con = (r.get("con") or "").strip()
+    if proper:
+        return proper
+    bayer = (r.get("bayer") or "").strip()
+    if bayer and con:
+        base, _, num = bayer.partition("-")
+        letter = GREEK.get(base, base)
+        return f"{letter}{num} {con}"
+    flam = (r.get("flam") or "").strip()
+    if flam and con:
+        return f"{flam} {con}"
+    for key, label in (("hr", "HR"), ("hd", "HD"), ("hip", "HIP")):
+        v = (r.get(key) or "").strip()
+        if v:
+            return f"{label} {v}"
+    return "unnamed"
+
+
+def _read_rows(path):
+    with open(path, newline="", encoding="utf-8") as fh:
+        for r in csv.DictReader(fh):
+            yield r
+
+
+def _filter_rows(rows):
+    """Keep stars brighter than CACHE_MAG with a spectral class O-M. Close companions that only have a
+    catalogue number (e.g. one component of Capella) are named after the named star beside them, and
+    entries whose type is only that of a distant companion ('comp') are dropped."""
+    raw = []
+    for r in rows:
+        try:
+            mag = float(r["mag"])
+            ra, dec = float(r["ra"]), float(r["dec"])
+        except (KeyError, ValueError):
+            continue
+        if r.get("id") == "0" or (r.get("proper") or "") == "Sol" or mag > CACHE_MAG:
+            continue
+        named = bool((r.get("proper") or "").strip() or (r.get("bayer") or "").strip()
+                     or (r.get("flam") or "").strip())
+        raw.append(dict(name=star_name(r), named=named, con=(r.get("con") or "").strip(),
+                        spect=(r.get("spect") or "").strip(), mag=mag, ra_h=ra, dec=dec))
+    if raw:
+        ra = np.array([x["ra_h"] for x in raw]) * 15.0
+        dec = np.array([x["dec"] for x in raw])
+        named_idx = np.array([i for i, x in enumerate(raw) if x["named"]], dtype=int)
+        for i, x in enumerate(raw):
+            if x["named"] or named_idx.size == 0:
+                continue
+            d_dec = np.abs(dec[named_idx] - dec[i])
+            d_ra = np.abs(ra[named_idx] - ra[i]) * math.cos(math.radians(dec[i]))
+            near = np.flatnonzero((d_dec < 30 / 3600.0) & (d_ra < 30 / 3600.0))
+            if near.size:
+                x["name"] = f"{raw[named_idx[near[0]]]['name']} (comp.)"
+    out = []
+    for x in raw:
+        cls = spectral_class(x["spect"])
+        if cls is None or "comp" in x["spect"]:
+            continue
+        out.append(dict(name=x["name"], con=x["con"], spect=x["spect"], cls=cls, mag=x["mag"],
+                        ra_h=x["ra_h"], dec=x["dec"]))
+    return out
+
+
+def _download(url, dest, progress=None):
+    req = urllib.request.Request(url, headers={"User-Agent": "visible-stars-by-class/1.0"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        got = 0
+        with open(dest, "wb") as fh:
+            while True:
+                chunk = resp.read(1 << 18)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                got += len(chunk)
+                if total and progress:
+                    progress(f"Downloading the star catalogue (one time only)… {100 * got / total:3.0f}%")
+
+
+def load_catalog(path=None, refresh=False, progress=None):
+    """List of star dicts (V <= 7, spectral class O-M). Builds the small cache on first use."""
+    if path:
+        return _filter_rows(_read_rows(path))
+    if CACHE_FILE.exists() and not refresh:
+        with open(CACHE_FILE, newline="", encoding="utf-8") as fh:
+            return [dict(r, mag=float(r["mag"]), ra_h=float(r["ra_h"]), dec=float(r["dec"]))
+                    for r in csv.DictReader(fh)]
+    if progress:
+        progress("First run: fetching the HYG star catalogue (one time, about 34 MB)…")
+    tmpdir = tempfile.mkdtemp(prefix="hyg_")
+    tmp = os.path.join(tmpdir, "hyg.csv")
+    try:
+        _download(HYG_URL, tmp, progress)
+        stars = _filter_rows(_read_rows(tmp))
+    except Exception as e:
+        raise RuntimeError(f"Could not download the star catalogue ({e}).\n\nDownload it in a browser from\n"
+                           f"{HYG_URL}\nthen use 'Catalogue file…' in this program to select it.")
+    finally:
+        try:
+            os.remove(tmp)
+            os.rmdir(tmpdir)
+        except OSError:
+            pass
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CACHE_FILE, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=["name", "con", "spect", "cls", "mag", "ra_h", "dec"])
+        w.writeheader()
+        w.writerows(stars)
+    return stars
+
+
+# ----------------------------------------------------------------------------------------------
+# Location, time zone, date/time
+# ----------------------------------------------------------------------------------------------
+LATLON_RE = re.compile(r"^\s*([+-]?\d+(?:\.\d+)?)\s*[,; ]\s*([+-]?\d+(?:\.\d+)?)\s*$")
+
+
+def resolve_location(text):
+    """(lat, lon, label) from 'lat, lon' or a place name (needs geopy and an internet connection)."""
+    m = LATLON_RE.match(text)
+    if m:
+        lat, lon = float(m.group(1)), float(m.group(2))
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            raise ValueError("Latitude must be between -90 and 90 and longitude between -180 and 180.")
+        return lat, lon, f"{lat:.4f}°, {lon:.4f}°"
+    try:
+        from geopy.geocoders import Nominatim
+    except ImportError:
+        raise ValueError("To look up place names, install geopy (pip install geopy), or type "
+                         "coordinates instead, for example   36.01, -84.27   (negative longitude = west).")
+    try:
+        loc = Nominatim(user_agent="visible-stars-by-class", timeout=10).geocode(text)
+    except Exception as e:
+        raise ValueError(f"The place-name lookup failed ({type(e).__name__}). Check your internet "
+                         "connection or type coordinates, for example   36.01, -84.27")
+    if loc is None:
+        raise ValueError(f"Could not find '{text}'. Try adding the state or country, or type coordinates.")
+    return float(loc.latitude), float(loc.longitude), loc.address
+
+
+def find_timezone(lat, lon):
+    """(tzinfo, name) from timezonefinder, or None if it is not installed or has no answer."""
+    try:
+        from timezonefinder import TimezoneFinder
+        from zoneinfo import ZoneInfo
+        name = TimezoneFinder().timezone_at(lat=lat, lng=lon)
+        if name:
+            return ZoneInfo(name), name
+    except Exception:
+        pass
+    return None
+
+
+TIME_FORMATS = ["%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %I:%M %p", "%Y-%m-%d %I:%M%p",
+                "%m/%d/%Y %H:%M", "%m/%d/%Y %I:%M %p", "%m/%d/%Y %I:%M%p", "%Y-%m-%dT%H:%M",
+                "%Y-%m-%d", "%m/%d/%Y"]
+
+
+def parse_when(text, tz):
+    """Aware UTC datetime from local-time text ('now', '2026-11-03 21:30', '11/3/2026 9:30 PM', …).
+    Adding 'UTC' at the end means the time is already UTC. A date alone means 22:00 local."""
+    s = text.strip()
+    if s.lower() in ("", "now"):
+        return datetime.now(timezone.utc)
+    use_tz = tz
+    if s.upper().endswith("UTC"):
+        s, use_tz = s[:-3].strip(), timezone.utc
+    elif s.upper().endswith("Z"):
+        s, use_tz = s[:-1].strip(), timezone.utc
+    for fmt in TIME_FORMATS:
+        try:
+            dt = datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        if "%H" not in fmt and "%I" not in fmt:
+            dt = dt.replace(hour=22)
+        return dt.replace(tzinfo=use_tz).astimezone(timezone.utc)
+    raise ValueError("Could not read that date and time. Examples:  2026-11-03 21:30   or   "
+                     "11/03/2026 9:30 PM   or   now")
+
+
+# ----------------------------------------------------------------------------------------------
+# Astronomy
+# ----------------------------------------------------------------------------------------------
+def sky_state(sun_alt):
+    """(description, rough naked-eye limiting magnitude or None for 'no stars visible')."""
+    if sun_alt > 0:
+        return "daytime (Sun above the horizon)", None
+    if sun_alt > -6:
+        return "civil twilight", 1.5
+    if sun_alt > -12:
+        return "nautical twilight", 3.5
+    if sun_alt > -18:
+        return "astronomical twilight", 5.0
+    return "dark sky", 99.0
+
+
+def compute_positions(stars, lat, lon, when_utc, height_m=0.0):
+    """Altitude and azimuth (degrees) of every star, plus the Sun's altitude."""
+    from astropy import units as u
+    from astropy.coordinates import AltAz, EarthLocation, SkyCoord, get_sun
+    from astropy.time import Time
+    try:
+        from astropy.utils import iers
+        iers.conf.auto_download = False       # no network needed; sub-arcsecond Earth-rotation data are
+        iers.conf.auto_max_age = None         # irrelevant for finding naked-eye stars
+        iers.conf.iers_degraded_accuracy = "ignore"
+    except Exception:
+        pass
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")       # e.g. astropy's "IERS predictive values are old" notice
+        loc = EarthLocation.from_geodetic(lon=lon * u.deg, lat=lat * u.deg, height=height_m * u.m)
+        t = Time(when_utc)
+        frame = AltAz(obstime=t, location=loc)
+        ra = np.array([s["ra_h"] for s in stars]) * 15.0
+        dec = np.array([s["dec"] for s in stars])
+        aa = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs").transform_to(frame)
+        sun = get_sun(t).transform_to(frame)
+        return aa.alt.deg, aa.az.deg, float(sun.alt.deg)
+
+
+def select_stars(stars, alt, az, classes, count, limit_mag, min_alt, rank="brightest"):
+    """{class: [star dict + alt/az]} with up to `count` visible stars per class, plus availability counts."""
+    chosen, available = {}, {}
+    for c in classes:
+        idx = [i for i, s in enumerate(stars) if s["cls"] == c and s["mag"] <= limit_mag and alt[i] >= min_alt]
+        available[c] = len(idx)
+        key = (lambda i: stars[i]["mag"]) if rank == "brightest" else (lambda i: -alt[i])
+        idx.sort(key=key)
+        chosen[c] = [dict(stars[i], alt=float(alt[i]), az=float(az[i])) for i in idx[:count]]
+    return chosen, available
+
+
+def compass(az):
+    return COMPASS[int((az % 360) / 22.5 + 0.5) % 16]
+
+
+# ----------------------------------------------------------------------------------------------
+# Output
+# ----------------------------------------------------------------------------------------------
+def save_csv(path, chosen):
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh)
+        w.writerow(["class", "star", "constellation", "spectral_type", "vmag", "altitude_deg", "azimuth_deg",
+                    "direction"])
+        for c, rows in chosen.items():
+            for s in rows:
+                w.writerow([c, s["name"], s["con"], s["spect"], f"{s['mag']:.2f}", f"{s['alt']:.1f}",
+                            f"{s['az']:.1f}", compass(s["az"])])
+
+
+
+
+# ----------------------------------------------------------------------------------------------
+# GUI
+# ----------------------------------------------------------------------------------------------
+CLASS_COLOR = {"O": "#3b4cc0", "B": "#2a9df4", "A": "#20b2aa", "F": "#8fbf2a",
+               "G": "#e0b000", "K": "#f28c28", "M": "#d9382b"}
+CLASS_TINT = {"O": "#e3e7fa", "B": "#e1f1fd", "A": "#dff5f3", "F": "#eef6dc",
+              "G": "#fbf1cc", "K": "#fde9d4", "M": "#fadcd9"}
+CLASS_BLURB = {"O": "hottest, blue", "B": "blue-white", "A": "white", "F": "yellow-white",
+               "G": "yellow (Sun)", "K": "orange", "M": "cool, red"}
+
+
+class StarApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Visible stars by spectral class")
+        self.geometry("1240x820")
+        self.minsize(1000, 800)
+        self.q = queue.Queue()
+        self.busy = False
+        self.stars = None            # catalogue (list of dicts), loaded on first search
+        self.catalog_path = None
+        self.loc = None              # (text, lat, lon, label)
+        self.result = None
+        self._build()
+        self.use_now()
+        self.after(100, self._poll)
+
+    # ---- layout ----
+    def _build(self):
+        self.status = tk.StringVar(value="Ready.")
+        ttk.Label(self, textvariable=self.status, anchor="w", relief="sunken", padding=(6, 2)).pack(
+            side="bottom", fill="x")
+        left = ttk.Frame(self, padding=(10, 10, 4, 10))
+        left.pack(side="left", fill="y")
+
+        g = ttk.LabelFrame(left, text="1. Location", padding=8)
+        g.pack(fill="x")
+        self.loc_var = tk.StringVar()
+        e = ttk.Entry(g, textvariable=self.loc_var, width=34)
+        e.grid(row=0, column=0, sticky="we")
+        e.bind("<Return>", lambda ev: self.lookup_location())
+        ttk.Button(g, text="Look up", command=self.lookup_location).grid(row=0, column=1, padx=(6, 0))
+        ttk.Label(g, text="A place name (e.g. Oak Ridge, TN) or  latitude, longitude\n"
+                          "(e.g. 36.01, -84.27;  negative longitude = west)",
+                  foreground="#666666", justify="left").grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        self.loc_info = tk.StringVar(value="")
+        ttk.Label(g, textvariable=self.loc_info, wraplength=330, justify="left",
+                  foreground="#1b5e20").grid(row=2, column=0, columnspan=2, sticky="w", pady=(3, 0))
+
+        g = ttk.LabelFrame(left, text="2. Date and time (local at that location)", padding=8)
+        g.pack(fill="x", pady=(8, 0))
+        self.date_var, self.time_var = tk.StringVar(), tk.StringVar()
+        ttk.Label(g, text="Date").grid(row=0, column=0, sticky="w")
+        ttk.Entry(g, textvariable=self.date_var, width=12).grid(row=0, column=1, padx=(4, 12))
+        ttk.Label(g, text="Time").grid(row=0, column=2, sticky="w")
+        ttk.Entry(g, textvariable=self.time_var, width=9).grid(row=0, column=3, padx=4)
+        ttk.Button(g, text="Now", width=5, command=self.use_now).grid(row=0, column=4, padx=(6, 0))
+        ttk.Label(g, text="Date as YYYY-MM-DD (or MM/DD/YYYY); time as 21:30 or 9:30 PM",
+                  foreground="#666666").grid(row=1, column=0, columnspan=5, sticky="w", pady=(3, 0))
+        self.utc_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(g, text="The time above is UTC", variable=self.utc_var).grid(
+            row=2, column=0, columnspan=3, sticky="w", pady=(3, 0))
+        ttk.Label(g, text="UTC offset if the\ntime zone is unknown:").grid(row=3, column=0, columnspan=3, sticky="w")
+        self.offset_var = tk.StringVar(value="-5")
+        ttk.Entry(g, textvariable=self.offset_var, width=6).grid(row=3, column=3, sticky="w", padx=4)
+
+        g = ttk.LabelFrame(left, text="3. How many stars of each class", padding=8)
+        g.pack(fill="x", pady=(8, 0))
+        self.count_var = tk.StringVar(value="5")
+        ttk.Spinbox(g, from_=1, to=100, textvariable=self.count_var, width=6).pack(side="left")
+
+        g = ttk.LabelFrame(left, text="4. Spectral classes", padding=8)
+        g.pack(fill="x", pady=(8, 0))
+        self.cls_vars = {}
+        for r, c in enumerate(CLASSES):
+            v = tk.BooleanVar(value=True)
+            self.cls_vars[c] = v
+            row = ttk.Frame(g)
+            row.grid(row=r // 2, column=r % 2, sticky="w", padx=(0, 10), pady=1)
+            tk.Label(row, text="■", fg=CLASS_COLOR[c], font=("TkDefaultFont", 12)).pack(side="left")
+            ttk.Checkbutton(row, text=f"{c}  {CLASS_BLURB[c]}", variable=v).pack(side="left")
+        b = ttk.Frame(g)
+        b.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Button(b, text="All", width=6, command=lambda: self._set_classes(True)).pack(side="left")
+        ttk.Button(b, text="None", width=6, command=lambda: self._set_classes(False)).pack(side="left", padx=4)
+
+        g = ttk.LabelFrame(left, text="Visibility options", padding=8)
+        g.pack(fill="x", pady=(8, 0))
+        self.minalt_var, self.limmag_var = tk.StringVar(value="20"), tk.StringVar(value="6.0")
+        ttk.Label(g, text="Minimum altitude (°)").grid(row=0, column=0, sticky="w")
+        ttk.Spinbox(g, from_=0, to=85, textvariable=self.minalt_var, width=6).grid(row=0, column=1, padx=6)
+        ttk.Label(g, text="Faintest star (Vmag)").grid(row=1, column=0, sticky="w")
+        ttk.Spinbox(g, from_=-1, to=8, increment=0.5, textvariable=self.limmag_var, width=6).grid(row=1, column=1, padx=6)
+        ttk.Label(g, text="List first").grid(row=2, column=0, sticky="w")
+        self.rank_var = tk.StringVar(value="brightest")
+        ttk.Combobox(g, textvariable=self.rank_var, values=["brightest", "highest in the sky"], width=16,
+                     state="readonly").grid(row=2, column=1, padx=6, pady=2)
+        self.ignore_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(g, text="Ignore daylight / twilight", variable=self.ignore_var).grid(
+            row=3, column=0, columnspan=2, sticky="w")
+
+        b = ttk.Frame(left)
+        b.pack(fill="x", pady=(12, 0))
+        self.find_btn = ttk.Button(b, text="Find stars", command=self.find)
+        self.find_btn.pack(side="left", fill="x", expand=True)
+        self.save_btn = ttk.Button(b, text="Save CSV…", command=self.save, state="disabled")
+        self.save_btn.pack(side="left", padx=(6, 0))
+        ttk.Button(left, text="Catalogue file…", command=self.choose_catalog).pack(anchor="w", pady=(8, 0))
+
+        # ---- right side ----
+        right = ttk.Frame(self, padding=(4, 10, 10, 10))
+        right.pack(side="left", fill="both", expand=True)
+        self.info = tk.StringVar(value="Enter a location, date and time, then press Find stars.")
+        ttk.Label(right, textvariable=self.info, wraplength=820, justify="left").pack(fill="x", pady=(0, 6))
+        nb = ttk.Notebook(right)
+        nb.pack(fill="both", expand=True)
+        self.nb = nb
+        tab_list, tab_sky = ttk.Frame(nb), ttk.Frame(nb)
+        nb.add(tab_list, text="Star list")
+        nb.add(tab_sky, text="Sky chart")
+
+        cols = ("cls", "n", "name", "con", "spect", "mag", "alt", "az", "dir")
+        heads = ("Class", "#", "Star", "Const.", "Spectral type", "Vmag", "Altitude", "Azimuth", "Direction")
+        widths = (50, 36, 190, 60, 120, 60, 70, 70, 70)
+        style = ttk.Style(self)
+        style.configure("Stars.Treeview", background="black", fieldbackground="black", foreground="white",
+                        rowheight=22)
+        style.map("Stars.Treeview", background=[("selected", "#2a4a7a")], foreground=[("selected", "white")])
+        self.tree = ttk.Treeview(tab_list, columns=cols, show="headings", selectmode="browse",
+                                 style="Stars.Treeview")
+        for c, h, w in zip(cols, heads, widths):
+            self.tree.heading(c, text=h)
+            self.tree.column(c, width=w, anchor="w" if c in ("name", "spect", "con") else "center",
+                             stretch=(c == "name"))
+        for c in CLASSES:                                  # plain white text on black (also set per row for macOS)
+            self.tree.tag_configure(c, background="black", foreground="white")
+        sb = ttk.Scrollbar(tab_list, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        self.fig = Figure(figsize=(6.5, 6.5), dpi=100)
+        self.canvas = FigureCanvasTkAgg(self.fig, master=tab_sky)
+        nav = NavigationToolbar2Tk(self.canvas, tab_sky, pack_toolbar=False)
+        nav.update()
+        nav.pack(side="bottom", fill="x")
+        self.canvas.get_tk_widget().pack(side="top", fill="both", expand=True)
+        self._placeholder("The stars you find are plotted here.\n(Centre = straight overhead, edge = horizon.)")
+
+
+    # ---- small helpers ----
+    def _set_classes(self, on):
+        for v in self.cls_vars.values():
+            v.set(on)
+
+    def _placeholder(self, text):
+        self.fig.clear()
+        self.fig.text(0.5, 0.5, text, ha="center", va="center", fontsize=12, color="#666666")
+        self.canvas.draw_idle()
+
+    def _tz_now(self):
+        if self.loc and self.loc[0] == self.loc_var.get().strip() and len(self.loc) > 4 and self.loc[4]:
+            return self.loc[4][0]
+        return None
+
+    def use_now(self):
+        tz = self._tz_now()
+        t = datetime.now(tz) if tz else datetime.now().astimezone()
+        self.date_var.set(t.strftime("%Y-%m-%d"))
+        self.time_var.set(t.strftime("%H:%M"))
+        self.utc_var.set(False)
+
+    def choose_catalog(self):
+        p = filedialog.askopenfilename(title="Select hygdata_v41.csv (the HYG star catalogue)")
+        if p:
+            self.catalog_path = p
+            self.stars = None
+            self.status.set(f"Will use the catalogue file {os.path.basename(p)}.")
+
+    # ---- background work ----
+    def _start(self, target, *args):
+        threading.Thread(target=target, args=args, daemon=True).start()
+
+    def _poll(self):
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                if kind == "progress":
+                    self.status.set(payload)
+                elif kind == "loc":
+                    self.loc = payload
+                    self.loc_info.set(f"{payload[3]}\nlat {payload[1]:.4f}°, lon {payload[2]:.4f}°"
+                                      + (f", time zone {payload[4][1]}" if payload[4] else
+                                         ", time zone unknown (set the UTC offset)"))
+                    self.status.set("Location found.")
+                elif kind == "error":
+                    self._set_busy(False)
+                    self.status.set("Failed.")
+                    messagebox.showerror("Visible stars", payload)
+                elif kind == "done":
+                    self._set_busy(False)
+                    self.show_result(payload)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll)
+
+    def _set_busy(self, busy):
+        self.busy = busy
+        self.find_btn.configure(state="disabled" if busy else "normal")
+        self.config(cursor="watch" if busy else "")
+
+    def _resolve(self, text):
+        """(text, lat, lon, label, (tzinfo, tzname) or None) - runs in a worker thread."""
+        if self.loc and self.loc[0] == text:
+            return self.loc
+        lat, lon, label = resolve_location(text)
+        return (text, lat, lon, label, find_timezone(lat, lon))
+
+    def lookup_location(self):
+        text = self.loc_var.get().strip()
+        if not text:
+            messagebox.showinfo("Location", "Type a place name or 'latitude, longitude' first.")
+            return
+        self.status.set("Looking up the location…")
+
+        def work():
+            try:
+                self.q.put(("loc", self._resolve(text)))
+            except Exception as e:
+                self.q.put(("error", str(e)))
+        self._start(work)
+
+    # ---- the search ----
+    def find(self):
+        if self.busy:
+            return
+        text = self.loc_var.get().strip()
+        if not text:
+            messagebox.showinfo("Location", "Enter a location first.")
+            return
+        try:
+            count = int(self.count_var.get())
+            if not 1 <= count <= 100:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Number of stars", "Enter a whole number from 1 to 100.")
+            return
+        classes = [c for c in CLASSES if self.cls_vars[c].get()]
+        if not classes:
+            messagebox.showinfo("Spectral classes", "Tick at least one spectral class.")
+            return
+        try:
+            min_alt = float(self.minalt_var.get())
+            limit = float(self.limmag_var.get())
+            if not 0 <= min_alt < 90:
+                raise ValueError
+        except ValueError:
+            messagebox.showerror("Visibility options", "Minimum altitude must be 0–89 and the faintest "
+                                 "magnitude a number such as 6.0.")
+            return
+        p = dict(text=text, count=count, classes=classes, min_alt=min_alt, limit=limit,
+                 rank="highest" if self.rank_var.get().startswith("highest") else "brightest",
+                 ignore_sky=self.ignore_var.get(), date=self.date_var.get().strip(),
+                 time=self.time_var.get().strip(), is_utc=self.utc_var.get(),
+                 offset=self.offset_var.get().strip())
+        self._set_busy(True)
+        self.status.set("Working…")
+        self._start(self._work, p)
+
+    def _work(self, p):
+        try:
+            loc = self._resolve(p["text"])
+            self.q.put(("loc", loc))
+            _, lat, lon, label, tzinfo = loc
+            if p["is_utc"]:
+                tz, tzname = timezone.utc, "UTC"
+            elif tzinfo:
+                tz, tzname = tzinfo
+            else:
+                try:
+                    h = float(p["offset"])
+                    if not -14 <= h <= 14:
+                        raise ValueError
+                except ValueError:
+                    raise ValueError("The time zone of this place could not be found automatically (install "
+                                     "timezonefinder, or enter the UTC offset in hours, e.g. -5).")
+                tz, tzname = timezone(timedelta(hours=h)), f"UTC{h:+g}"
+            when_text = (p["date"] + " " + p["time"]).strip()
+            if not p["date"] and not p["time"]:
+                when_text = "now"
+            elif not p["time"]:
+                when_text = p["date"]                       # a date alone means 22:00 local
+            elif not p["date"]:
+                raise ValueError("Enter a date as well as a time (or press 'Now').")
+            when_utc = parse_when(when_text, tz)
+            if self.stars is None:
+                self.stars = load_catalog(self.catalog_path, False,
+                                          lambda s: self.q.put(("progress", s)))
+            self.q.put(("progress", "Computing positions…"))
+            alt, az, sun_alt = compute_positions(self.stars, lat, lon, when_utc)
+            state, sky_lim = sky_state(sun_alt)
+            limit, notes = p["limit"], []
+            if not p["ignore_sky"]:
+                if sky_lim is None:
+                    chosen = {c: [] for c in p["classes"]}
+                    avail = {c: 0 for c in p["classes"]}
+                    notes.append("No stars are visible to the naked eye in daylight. Choose a time after "
+                                 "sunset, or tick 'Ignore daylight / twilight'.")
+                    limit = None
+                elif sky_lim < limit:
+                    notes.append(f"Twilight: limiting magnitude reduced from {limit:g} to about {sky_lim:g} "
+                                 "(rough estimate).")
+                    limit = sky_lim
+            if limit is not None:
+                chosen, avail = select_stars(self.stars, alt, az, p["classes"], p["count"], limit,
+                                             p["min_alt"], p["rank"])
+            self.q.put(("done", dict(p=p, label=label, lat=lat, lon=lon, tzname=tzname, tz=tz,
+                                     when_utc=when_utc, sun_alt=sun_alt, state=state, limit=limit,
+                                     notes=notes, chosen=chosen, avail=avail)))
+        except Exception as e:
+            self.q.put(("error", str(e)))
+
+    # ---- showing results ----
+    def show_result(self, r):
+        self.result = r
+        p = r["p"]
+        local = r["when_utc"].astimezone(r["tz"])
+        lines = [f"{r['label']}",
+                 f"{local:%Y-%m-%d %H:%M} {r['tzname']}  ({r['when_utc']:%Y-%m-%d %H:%M} UTC)    "
+                 f"Sun altitude {r['sun_alt']:+.1f}° - {r['state']}"]
+        if r["limit"] is not None:
+            lines.append(f"Showing stars at least {p['min_alt']:g}° above the horizon and brighter than "
+                         f"V = {r['limit']:g}, {'brightest' if p['rank'] == 'brightest' else 'highest'} first.")
+        lines += r["notes"]
+        self.info.set("\n".join(lines))
+
+        self.tree.delete(*self.tree.get_children())
+        total = 0
+        for c, rows in r["chosen"].items():
+            if not rows:
+                self.tree.insert("", "end", values=(c, "", "none visible", "", "", "", "", "", ""), tags=(c,))
+            for n, s in enumerate(rows, 1):
+                total += 1
+                self.tree.insert("", "end", tags=(c,), values=(
+                    c, n, s["name"], s["con"], s["spect"], f"{s['mag']:.2f}", f"{s['alt']:.0f}°",
+                    f"{s['az']:.0f}°", compass(s["az"])))
+            short = p["count"] - len(rows)
+            if rows and short > 0:
+                self.tree.insert("", "end", tags=(c,), values=(
+                    c, "", f"(only {len(rows)} qualify - {r['avail'][c]} in the sky)", "", "", "", "", "", ""))
+        self.save_btn.configure(state="normal" if total else "disabled")
+        self.draw_chart(r)
+        self.status.set(f"{total} stars listed.")
+
+    def draw_chart(self, r):
+        self.fig.clear()
+        ax = self.fig.add_subplot(111, projection="polar")
+        ax.set_theta_zero_location("N")
+        ax.set_theta_direction(1)                         # E to the left, as when looking up at the sky
+        ax.set_rlim(0, 90)
+        ax.set_rticks([30, 60, 90])
+        ax.set_yticklabels(["60°", "30°", "0°"], fontsize=8, color="#777777")
+        ax.set_xticks(np.radians([0, 90, 180, 270]))
+        ax.set_xticklabels(["N", "E", "S", "W"], fontsize=12, fontweight="bold")
+        ax.grid(alpha=0.35)
+        min_alt = r["p"]["min_alt"]
+        th = np.linspace(0, 2 * np.pi, 200)
+        ax.plot(th, np.full_like(th, 90 - min_alt), "--", color="#999999", lw=0.8)
+        stars = [dict(s, cls=c) for c, rows in r["chosen"].items() for s in rows]
+        label_them = len(stars) <= 45
+        for c in CLASSES:
+            pts = [s for s in stars if s["cls"] == c]
+            if not pts:
+                continue
+            ax.scatter([np.radians(s["az"]) for s in pts], [90 - s["alt"] for s in pts],
+                       s=[max(14, 150 * 10 ** (-0.18 * (s["mag"] + 1.5))) for s in pts], color=CLASS_COLOR[c],
+                       edgecolor="k", linewidth=0.4, zorder=3, label=f"{c} ({len(pts)})")
+            if label_them:
+                for s in pts:
+                    ax.annotate(s["name"], (np.radians(s["az"]), 90 - s["alt"]), xytext=(5, 4),
+                                textcoords="offset points", fontsize=7.5, zorder=4)
+        if stars:
+            ax.legend(loc="upper right", bbox_to_anchor=(1.18, 1.08), fontsize=8, title="Class", title_fontsize=8)
+        local = r["when_utc"].astimezone(r["tz"])
+        ax.set_title(f"Sky at {local:%Y-%m-%d %H:%M} {r['tzname']}  (looking up, dashed ring = minimum altitude)",
+                     fontsize=10, pad=18)
+        self.canvas.draw_idle()
+
+    def save(self):
+        if not self.result:
+            return
+        p = filedialog.asksaveasfilename(title="Save the star list", defaultextension=".csv",
+                                         initialfile="visible_stars.csv")
+        if not p:
+            return
+        try:
+            save_csv(p, self.result["chosen"])
+        except Exception as e:
+            messagebox.showerror("Save failed", str(e))
+            return
+        self.status.set(f"Saved {p}")
+
+
+def main():
+    app = StarApp()
+    app.lift()
+    app.attributes("-topmost", True)                    # come to the front (Spyder can hide the window)
+    app.after(400, lambda: app.attributes("-topmost", False))
+    app.focus_force()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
